@@ -1,0 +1,256 @@
+# med_gen_ai.py
+# -------------------------------------------------
+# Med-Gen AI Assistant – improved FAQ & Disease logic
+# -------------------------------------------------
+import pandas as pd
+import string
+from difflib import get_close_matches
+
+# ------------------------------------------------------------------
+# 1. LOAD DATA  (adjust paths as needed or mount Google Drive/Colab)
+# ------------------------------------------------------------------
+covid_data    = pd.read_csv("covid_worldwide.csv")
+disease_data  = pd.read_csv("Disease_symptom_and_patient_profile_dataset (1).csv")
+insurance_data = pd.read_csv("insurance.csv")
+
+# Quick column sanity checks – comment out if you’d rather skip
+for col in ["Disease"]:
+    if col not in disease_data.columns:
+        raise ValueError(f"❌ Column “{col}” missing in disease_data")
+
+for col in ["age", "region", "charges"]:
+    if col not in insurance_data.columns:
+        raise ValueError(f"❌ Column “{col}” missing in insurance_data")
+
+# ------------------------------------------------------------------
+# 2. PREBUILT FAQS  (keys remain human-friendly; matching is flexible)
+# ------------------------------------------------------------------
+faqs = {
+    "what is med-gen ai":
+        "Med-Gen AI is a virtual health assistant that helps you understand "
+        "symptoms and get preliminary medical advice using AI.",
+    "can you diagnose my illness":
+        "I can suggest possible conditions based on your symptoms, but I don't "
+        "give final diagnoses. Always consult a doctor.",
+    "is my data safe":
+        "Yes, your data is encrypted and private. We never share it without "
+        "your permission.",
+    "can i get medicine here":
+        "I can suggest over-the-counter medications, but I can't prescribe. "
+        "You need a doctor for that.",
+    "is med-gen ai free":
+        "Some features are free, others may require a subscription. "
+        "Please check the app for details.",
+    "is it available 24 7":
+        "Yes! I'm here to assist you anytime, 24/7.",
+    "what health issues can you help with":
+        "I can help with common issues like fever, cough, allergies, skin "
+        "problems, and more.",
+    "can elderly people use it":
+        "Yes. I have a simple interface and support voice and multiple "
+        "languages to help everyone use me easily.",
+    "can i talk to a real doctor":
+        "In some versions, yes. Check your app to see if doctor chat is "
+        "available in your plan."
+}
+
+# Helper to “clean” text (lowercase, strip punctuation/extra spaces)
+def _clean(text: str) -> str:
+    return (
+        text.lower()
+            .translate(str.maketrans("", "", string.punctuation))
+            .strip()
+    )
+
+# Pre-compute cleaned FAQ keys once
+_cleaned_faqs = {_clean(k): v for k, v in faqs.items()}
+
+def find_faq_answer(user_input: str):
+    """
+    Return FAQ answer if user_input is a close match to any FAQ key.
+    Uses exact, substring, then fuzzy matching (difflib).
+    """
+    cleaned = _clean(user_input)
+
+    # 1️⃣ exact cleaned key
+    if cleaned in _cleaned_faqs:
+        return _cleaned_faqs[cleaned]
+
+    # 2️⃣ substring / superset
+    for q, ans in _cleaned_faqs.items():
+        if q in cleaned or cleaned in q:
+            return ans
+
+    # 3️⃣ fuzzy (handles small typos / missing spaces)
+    close = get_close_matches(cleaned, list(_cleaned_faqs.keys()), n=1, cutoff=0.7)
+    if close:
+        return _cleaned_faqs[close[0]]
+
+    return None
+
+
+# ------------------------------------------------------------------
+# 3. COVID-19 STATISTICS LOOKUP
+# ------------------------------------------------------------------
+def get_covid_stats(country: str):
+    country = country.strip().lower()
+    # try exact match first
+    match = covid_data[covid_data["Country"].str.lower() == country]
+
+    # if not found, use fuzzy match on country column
+    if match.empty:
+        close = get_close_matches(
+            country,
+            covid_data["Country"].str.lower(),
+            n=1,
+            cutoff=0.8
+        )
+        if close:
+            match = covid_data[covid_data["Country"].str.lower() == close[0]]
+
+    if match.empty:
+        return "Sorry, I couldn't find COVID-19 data for that country."
+
+    r = match.iloc[0]
+    return (
+        f"COVID-19 Stats for {r['Country']}:\n"
+        f"- Total Cases: {r['Total Cases']}\n"
+        f"- Total Deaths: {r['Total Deaths']}\n"
+        f"- Total Recovered: {r['Total Recovered']}\n"
+        f"- Active Cases: {r['Active Cases']}\n"
+        f"- Population: {r['Population']}"
+    )
+
+# ------------------------------------------------------------------
+# 4. DISEASE PREDICTION
+# ------------------------------------------------------------------
+# Pick whichever symptom columns you know exist in your CSV
+SYMPTOMS = ["Fever", "Cough", "Fatigue", "Shortness of Breath"]
+
+def _ask_yes_no(question: str) -> str:
+    """Prompt the user and return 'yes' or 'no'."""
+    while True:
+        ans = input(question).strip().lower()
+        if ans.startswith("y"):
+            return "yes"
+        if ans.startswith("n"):
+            return "no"
+        print("Please answer yes or no.")
+
+def predict_disease():
+    """
+    Narrow down rows where every asked-about symptom matches the user's yes/no.
+    Handles:
+      • Missing symptom columns (they’re ignored)
+      • NaN values → assumed 'no'
+      • Mixed-case 'Yes'/'No' in data
+    """
+    print("🩺  Please answer the following symptom questions with Yes/No:\n")
+    user_symptoms = {s: _ask_yes_no(f"Do you have {s}? ") for s in SYMPTOMS}
+
+    # Start with full dataset and iteratively filter
+    candidates = disease_data.copy()
+
+    for symptom in SYMPTOMS:
+        if symptom not in candidates.columns:
+            # Column absent in CSV → can’t filter by it
+            continue
+        candidates = candidates[
+            candidates[symptom]
+              .fillna("no")                # treat NaN as "no"
+              .str.lower()
+              .eq(user_symptoms[symptom])
+        ]
+
+    if candidates.empty:
+        return (
+            "I couldn't find any disease in the dataset matching those "
+            "symptoms. Please consult a healthcare professional."
+        )
+
+    # If multiple remain, choose the most common
+    likely = candidates["Disease"].mode()[0]
+    return f"Based on your answers, you **might** have: {likely}"
+
+
+# ------------------------------------------------------------------
+# 5. MEDICAL COST ESTIMATION
+# ------------------------------------------------------------------
+def estimate_medical_cost():
+    try:
+        age    = int(input("Enter your age: ").strip())
+        bmi    = float(input("Enter your BMI: ").strip())
+        region = input("Enter your region (northeast/northwest/southeast/southwest): ") \
+                   .strip().lower()
+
+        if region not in {"northeast", "northwest", "southeast", "southwest"}:
+            return ("Invalid region. Please enter one of: "
+                    "northeast, northwest, southeast, southwest.")
+
+        subset = insurance_data[
+            (insurance_data["age"] == age) &
+            (insurance_data["region"].str.lower() == region)
+        ]
+
+        if subset.empty:
+            return "Sorry, not enough data to estimate cost for your profile."
+
+        avg_cost = subset["charges"].mean()
+        return f"Estimated average medical charges: ${avg_cost:,.2f}"
+
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ------------------------------------------------------------------
+# 6. CHAT LOOP
+# ------------------------------------------------------------------
+def chatbot():
+    print("🤖  Welcome to Med-Gen AI Assistant!")
+    print("Ask a health-related question or type:")
+    print("   • covid <country>")
+    print("   • predict disease")
+    print("   • estimate cost")
+    print("   • exit\n")
+
+    # === Show FAQ questions on startup ===
+    print("Here are some questions you can ask me:\n")
+    for question in faqs:
+        print(f"   • {question.capitalize()}")
+    print()
+
+    while True:
+        user = input("You: ").strip()
+        if not user:
+            print("Please enter something.")
+            continue
+
+        if user.lower() == "exit":
+            print("👋  Goodbye! Stay safe and healthy.")
+            break
+
+        # ------------ Commands ------------
+        if user.lower().startswith("covid "):
+            country = user[6:].strip()
+            print("Med-Gen AI:", get_covid_stats(country))
+            continue
+
+        if "predict disease" in user.lower():
+            print("Med-Gen AI:", predict_disease())
+            continue
+
+        if "estimate cost" in user.lower():
+            print("Med-Gen AI:", estimate_medical_cost())
+            continue
+
+        # ------------ FAQ / fallback ------------
+        faq = find_faq_answer(user)
+        if faq:
+            print("Med-Gen AI:", faq)
+        else:
+            print("Med-Gen AI: Sorry, I don't understand. "
+                  "Type 'help' for commands or rephrase your question.")
+
+# Run chatbot if this file is executed directly
+if __name__ == "__main__":
+    chatbot()
